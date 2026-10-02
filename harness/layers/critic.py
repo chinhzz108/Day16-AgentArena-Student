@@ -78,17 +78,104 @@ class Critic(Middleware):
 
     name = "critic"
 
+    # ------------------------------------------------------------------ #
+    #  Helper: kiểm tra text có xuất hiện nguyên văn trong observed_text  #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _seen(ctx, text: str) -> bool:
+        """True nếu text xuất hiện nguyên văn trong bất kỳ dòng nào agent đã quan sát."""
+        if not text:
+            return False
+        # ctx.saw() là wrapper chính thức nếu có
+        if hasattr(ctx, "saw") and callable(ctx.saw):
+            return ctx.saw(text)
+        # Fallback: kiểm tra toàn chuỗi trước
+        observed = getattr(ctx, "observed_text", "") or ""
+        if text in observed:
+            return True
+        # Fallback line-by-line (handle whitespace/newline khác)
+        return any(text in line for line in observed.splitlines())
+
+    @staticmethod
+    def _find_doc_for(ctx, text: str):
+        """Trả về doc_id của tài liệu ĐÃ QUAN SÁT chứa text trên một dòng."""
+        if ctx.corpus is None:
+            return None
+        observed = getattr(ctx, "observed_text", "") or ""
+        for d in ctx.corpus.docs:
+            if not d.body:
+                continue
+            # Chỉ xét tài liệu đã về nguyên vẹn
+            if d.body not in observed:
+                continue
+            if any(text in line for line in d.body.splitlines()):
+                return d.doc_id
+        return None
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        valid_claims = []
+        contradiction = False
+
+        # Liên từ dùng để tách câu ghép mâu thuẫn
+        _SPLIT_CONJ = (" và ", ", và ", " nhưng ", "; ")
+
+        for claim in claims:
+            if not isinstance(claim, dict) or "text" not in claim:
+                continue
+            text = claim.get("text", "")
+
+            # 1. Claim có trong observed_text nguyên văn -> giữ nguyên
+            if self._seen(ctx, text):
+                valid_claims.append(claim)
+                continue
+
+            # 2. Thử tách câu ghép bằng các liên từ nối
+            split_success = False
+            for conj in _SPLIT_CONJ:
+                if conj not in text:
+                    continue
+                left, right = text.split(conj, 1)
+                left = left.strip()
+                right = right.strip()
+                if not left or not right:
+                    continue
+                if self._seen(ctx, left) and self._seen(ctx, right):
+                    left_doc = self._find_doc_for(ctx, left)
+                    right_doc = self._find_doc_for(ctx, right)
+                    if left_doc and right_doc and left_doc != right_doc:
+                        valid_claims.append({"text": left, "doc_id": left_doc})
+                        valid_claims.append({"text": right, "doc_id": right_doc})
+                        contradiction = True
+                        split_success = True
+                        break
+                    elif left_doc and right_doc and left_doc == right_doc:
+                        # Cùng tài liệu -> giữ nửa nào có trong doc tốt hơn
+                        valid_claims.append({"text": left, "doc_id": left_doc})
+                        split_success = True
+                        break
+            if split_success:
+                continue
+
+            # 3. Không tách được -> bỏ qua (bịa)
+
+        if contradiction:
+            report["abstain"] = True
+
+        # 4. Nếu không còn claim nào -> abstain
+        if not valid_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để kết luận."
+        else:
+            report["claims"] = valid_claims
+            doc_ids = {c["doc_id"] for c in valid_claims if isinstance(c, dict) and c.get("doc_id")}
+            report["citations"] = sorted(doc_ids)
+
+        return report
